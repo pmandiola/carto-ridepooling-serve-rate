@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Ride-pooling serving rate exploration | NYU CUSP</title>
+    <meta name="viewport" content="initial-scale=1.0">
+    <meta charset="utf-8">
+    <link href="https://fonts.googleapis.com/css?family=Montserrat:400,600,700|Open+Sans:300,400,600" rel="stylesheet">
+
+    <!-- Include Leaflet -->
+    <script src="https://unpkg.com/leaflet@1.3.1/dist/leaflet.js"></script>
+    <link href="https://unpkg.com/leaflet@1.3.1/dist/leaflet.css" rel="stylesheet">
+    <!-- Include CARTO.js -->
+    <script src="https://libs.cartocdn.com/carto.js/v4.1.11/carto.min.js"></script>
+    <!-- Include D3-->
+    <script src="https://d3js.org/d3.v5.min.js"></script>
+    
+    <link href="https://fonts.googleapis.com/css?family=Montserrat:600" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css?family=Open+Sans" rel="stylesheet">
+    <link rel="stylesheet" href="https://libs.cartocdn.com/cartodb.js/v3/3.15/themes/css/cartodb.css" />
+    <link href="style.css" rel="stylesheet">
+
+  </head>
+  <body>
+    <div id="main">
+        <!-- Map -->
+        <div id="map"></div>
+
+        <!-- Toolbox -->
+        <div id="toolbox" class="toolbox">
+            <div class="box">
+                <header>
+                <h1>Ride-pooling serve rate</h1>
+                </header>
+
+                <p>
+
+                <section class="description">
+                    Explore how ride-pooling serve rate changes depending on time, location, or number of the request.                    
+                </section>
+
+                <p>
+                
+                <svg id="chart"></svg>
+
+                <svg id="scatter"></svg>
+
+                <section  class="footnote">
+                    This visualization was built with Leaflet + D3, using Carto as a backend. Only a random sample of 15% of requests are displayed.
+                </section>
+
+            </div>
+        </div>
+    </div>
+
+    <script>
+        
+
+        const SHAPE_URL  = "manhattan_census_tracts.geojson";
+
+        Promise.all([d3.json(SHAPE_URL)]).then(dataList => {
+            initVisualization(dataList)
+        });
+
+        function initVisualization(dataList) {
+            let polygons  = dataList[0],
+
+                // This is our LeafLet map with an editable circle selection.
+                // See createBaseMap() for more details.
+                baseMap   = createBaseMap(),
+                
+                // This holds the current selection of our application, the label
+                // for the cuisine, and the counts per zip code.
+                selection = {hour: 'All', data: []},
+            
+                // This is to initiate a Carto's client to access the data and
+                // visualizations on Carto. Note, for public data sets, the API
+                // Key can be set to "default_public"
+                client    = new carto.Client({
+                                apiKey: 'default_public',
+                                username: 'pmandiola',
+                            });
+
+                // Define our data source as a SQL query
+                const sqlSource = new carto.source.SQL(`
+                        SELECT
+                            r.cartodb_id,
+                            EXTRACT(HOUR FROM to_timestamp(r.timestamp) at time zone 'EDT') AS request_hour,
+                            CAST(r.actual_pickup > 0 AS INT) AS served,
+                            ct.ct2010
+                        FROM requests r TABLESAMPLE SYSTEM(15)
+                            LEFT JOIN manhattan m ON r.requested_pickup = m.id,
+                            manhattan_census_tracts ct
+                        WHERE ST_Intersects(m.the_geom, ct.the_geom)
+                    `);
+
+            // First, populate our leaflet map
+            createMap(baseMap, polygons, selection, sqlSource);
+            
+            // And go fetch the restaurants data from Carto, and build the chart
+            createChartsFromCarto(client, baseMap[1], selection, sqlSource);
+        }
+
+        function createBaseMap() {
+            let center    = [40.7831, -73.9712],
+                baseLight = L.tileLayer('https://cartodb-basemaps-{s}.global.ssl.fastly.net/light_all/{z}/{x}/{y}.png',
+                                        { maxZoom: 18, }),
+                baseDark  = L.tileLayer('https://cartodb-basemaps-{s}.global.ssl.fastly.net/dark_all/{z}/{x}/{y}.png',
+                                        { maxZoom: 18, }),
+                dMap      = L.map('map', {
+                                center: center,
+                                zoom: 12,
+                                layers: [baseLight],
+                                interactive: false
+                            }),
+                svg       = d3.select(dMap.getPanes().overlayPane).append("svg")
+                                .attr("overflow", 'visible')
+                g         = svg.append("g").attr("class", "leaflet-zoom-hide");
+            
+            L.control.layers({
+                                "Light": baseLight,
+                                "Dark" : baseDark,
+                            }).addTo(dMap);
+
+            // dMap.dragging.disable();
+            // dMap.touchZoom.disable();
+            // dMap.doubleClickZoom.disable();
+            // dMap.scrollWheelZoom.disable();
+            
+            return [svg, g, dMap];
+        }
+
+        // =====================================================================
+        // This is similar to what we have in the previous labs, except that
+        // instead of passing the data, we pass the current selection with both
+        // the cuisine name and the data.
+        // =====================================================================
+        function createMap(baseMap, polygons, selection, sqlSource) {
+        
+            function projectPoint(x, y) {
+                let point = dMap.latLngToLayerPoint(new L.LatLng(y, x));
+                this.stream.point(point.x, point.y);
+            }
+
+            let projection = d3.geoTransform({point: projectPoint}),
+                path       = d3.geoPath().projection(projection),
+                svg        = baseMap[0],
+                g          = baseMap[1],
+                dMap       = baseMap[2];
+
+            // var brush = d3.brush()
+            //             .extent([[0, 0], [svg.node().getBBox().width, svg.node().getBBox().height]])
+            //             .on("end", b => {
+            //                 if (!d3.event.sourceEvent) return;
+
+            //                 if (
+            //                     d3.event.sourceEvent &&
+            //                     d3.event.sourceEvent.type === "zoom"
+            //                 )
+            //                     return;
+            //                 if (d3.event.selection) {
+
+            //                     const [[x0, y0], [x1, y1]] = d3.event.selection;
+            //                     // s = data.filter(d => x0 <= x(d[1]) && x(d[1]) < x1 && y0 <= y(d[2]) && y(d[2]) < y1);
+
+            //                     // selected = s
+
+            //                     // resetFilters(sqlSource)
+            //                     // filterCategory.set('in', selected)
+
+            //                     // highlightCircles(selected)
+            //                     // updateBars(selected)
+            //                     // brushG.classed('active', true)
+            //                 }
+            //                 else {
+            //                     // selected = []
+            //                     // resetFilters(sqlSource)
+            //                     // highlightCircles(selected)
+            //                     // updateBars(selected)
+            //                     // brushG.classed('active', false)
+            //                 } 
+            //             })
+            //             // .on("start", b => { d3.select('.brush.active').dispatch("reset") });
+            // var brushG = g.append("g")
+            //             .attr("class", "brush")
+            //             .call(brush)
+                        // .on("reset", () => { brush.move(brushG, null) });
+            
+            // The legend control is an overlay layer, i.e. it doesn't move with
+            // the user interactions. We create this control through LeafLet, and
+            // add it to our map.
+            let legendControl   = L.control({position: 'topleft'});
+            
+            // On adding the legend to LeafLet, we will setup a <div> to show
+            // the selection information.
+            legendControl.onAdd = addLegendToMap;
+            legendControl.addTo(dMap);
+            
+            // The tricky part now is we need to sync up the projection between
+            // LeafLet and D3's shapes. We need to write a special handler for
+            // that, naming reproject(). This will get called whenever the user
+            // zoon in or out with the map.
+            dMap.on("zoomend", reproject);
+            dMap.on("resize", reproject);
+            reproject();
+            
+            // This function gets called when we first add the legend box. We
+            // perform some styling to make it looks nice here.
+            function addLegendToMap(map) {
+                let div    = L.DomUtil.create('div', 'legendbox'),
+                    ndiv   = d3.select(div)
+                            .style("left", "50px")
+                            .style("top", "-70px"),
+                    lsvg   = ndiv.append("svg"),
+                    legend = lsvg.append("g")
+                            .attr("class", "legend")
+                            .attr("transform", "translate(0, 20)");
+                legend.append("text")
+                .attr("class", "axis--map--caption")
+                .attr("y", -10)
+                .attr("x", 15);
+                return div;
+            };
+
+            // This function realign the shapes to the zoom level of LeafLef map.
+            // The key action here is to get the bounds of the geometries in this
+            // zoom, reproject the path, and update all geometries with the new
+            // reprojected information.
+            function reproject() {
+                // First we compute the bounds, and shift our SVG accordingly
+                    bounds = path.bounds(polygons);
+                let topLeft     = bounds[0],
+                    bottomRight = bounds[1],
+                    container = dMap.getContainer().getBoundingClientRect(),
+                    transform = d3.select(dMap.getPanes().mapPane).style('transform'),
+                    trans_x = parseInt(transform.substring(transform.indexOf('(')+1, transform.indexOf('px'))),
+                    trans_y = parseInt(transform.substring(transform.indexOf(',')+1, transform.indexOf('px', transform.indexOf(','))));
+                
+                svg.attr("width", container.width)
+                    .attr("height", container.height)
+
+                // brush.extent([[- trans_x, - trans_y], [container.width - trans_x, container.height - trans_y]])
+                // brushG.call(brush)
+
+                // Then also transform our map group
+                // g.attr("transform", `translate(${-topLeft[0]}, ${-topLeft[1]})`);
+
+                // And update the actual D3 visual elements
+                let shapes = g.selectAll(".polygon")
+                .data(polygons.features); // we rejoin the data
+                shapes
+                .enter().append("path")
+                    .attr("class", "polygon")
+                    .style("fill-opacity", 0.8)
+                    .style("stroke", "black")
+                    .style("stroke-opacity", 0.2)
+                .merge(shapes) // and perform updates on both match and unmatches
+                    .attr("d", path);
+
+                // Redraw the map
+                updateMap(selection);
+            }
+        }
+
+        function updateMap(selection) {
+            let data     = selection.data,
+                steps    = 5,
+                colorScale = d3.scaleThreshold()
+                            .domain(d3.range(0.2, 1, 1/steps))
+                            .range(d3.schemeRdYlGn[steps])
+                polygons = d3.selectAll(".polygon")
+                            .data(data, d => (d[0]?d[0]:d.properties.ct2010)),
+                legendScale = d3.scaleLinear()
+                            .domain([0,0.2,0.4,0.6,0.8,1])
+                            .range([15, 65])
+                legend   = d3.select(".legend"),
+                formatNumber = d3.format(".0%");
+
+            polygons
+                .transition().duration(300)
+                .style("fill", d => colorScale(d[1]))
+            
+            polygons.exit()
+                .transition().duration(300)
+                .style("fill", "lightGray");
+
+            legend.call(d3.axisBottom(legendScale)
+                .tickSize(13)
+                .tickValues([0,0.2,0.4,0.6,0.8,1])
+                .tickFormat(formatNumber))
+
+            legend.selectAll("rect")
+                .data(colorScale.range().map(function(color) {
+                    var d = colorScale.invertExtent(color);
+                    if (d[0] == null) d[0] = legendScale.domain()[0];
+                    if (d[1] == null) d[1] = legendScale.domain()[1];
+                    return d;
+                }))
+                .enter().insert("rect", ".tick")
+                    .attr("height", 8)
+                    .attr("x", function(d) { return legendScale(d[0]); })
+                    .attr("width", function(d) { return 50; })//Math.abs(legendScale(d[1]) - legendScale(d[0])); })
+                    .attr("fill", function(d) { return colorScale(d[0]); })
+
+            legend.select("text")
+                .text('Census tract serve rate');
+        }
+
+        function highlightMap(data) {
+            let polygons = d3.selectAll(".polygon")
+                            .data(data, d => (d[0]?d[0]:d.properties.ct2010))
+
+            polygons
+                .transition().duration(300)
+                .style("stroke-opacity", 1)
+                .style("stroke-width", '2px')
+                .style("fill-opacity", 1);
+            
+            polygons.exit()
+                .transition().duration(300)
+                .style("stroke-opacity", 0.2)
+                .style("stroke-width", '1px')
+                .style("fill-opacity", 0.8);
+        }
+
+        function createChartsFromCarto(client, gMap, selection, sqlSource) {
+
+            // This is the call-back function, which will be called whenever our
+            // queried data is changed. Since we only want to call it intially
+            // to create our chart, we also remove its signal in the call so 
+            // that all change events will not trigger this.
+            var initBarChart = function (categories, svgID, title) {
+                // With that, we go through the typical createChart() as seen in
+                // the previous labs
+                createChart(svgID, categories, sqlSource, selection, title);
+                
+                // This is to turn off the signal, since we only want to call once
+                servedByHourView.off('dataChanged');
+            }
+
+            let servedByHour = null;
+            let totalByHour = null;
+            let servedByCt = null;
+            let totalByCt = null;
+            let updateCircles = null;
+            function getCategories(newData) {
+                return newData.categories.map(d => [d.name, d.value]).sort((x,y) => d3.ascending(x[0], y[0]));
+            }
+
+            function maybeInitScatter (svgID, title) {
+
+                if (servedByCt === null && totalByCt === null) console.log('NO');
+                else {
+                    joinedByCt = servedByCt.filter((d,i) => totalByCt[i] !== undefined).map((d,i) => [d[0], d[1], totalByCt[i][1]])
+                    
+                    if (updateCircles === null) 
+                        updateCircles = createScatter('scatter', joinedByCt, sqlSource, selection, title);
+                    else
+                        updateCircles(joinedByCt)
+                }
+
+                // totalByCtView.off('dataChanged');
+            }
+
+            const servedByHourView = new carto.dataview.Category(
+                sqlSource,  'request_hour', {
+                operation: carto.operation.AVG,
+                operationColumn: 'served',
+                limit: 1000,
+            }).on('dataChanged', newData => {
+                servedByHour = getCategories(newData)
+                initBarChart(servedByHour, 'chart', "Citywide serve rate by hour")
+            });
+
+            const totalByHourView = new carto.dataview.Category(
+                sqlSource,  'request_hour', {
+                operation: carto.operation.COUNT,
+                limit: 1000,
+            }).on('dataChanged', newData => {
+                totalByHour = getCategories(newData)
+                //setTimeout(maybeInitScatter('scatter', "Total requests vs serve rate per hour"), 500)
+            });
+
+
+            // The view above is good for retrieving the restaurant counts
+            // to build our bar chart. In addition, we also need the counts
+            // per zip code to build our map as well. This is the view for it.
+            //
+            // Note: we defined the call-back function in-place below (instead
+            // of putting that into another variable like initBarChart) since
+            // we do not need to store the function for turn off the signals.
+            // The initBarChart declaration above is needed for that purpose.
+            const servedByCtView = new carto.dataview.Category(
+                sqlSource,  'ct2010', {
+                operation: carto.operation.AVG,
+                operationColumn: 'served',
+                limit: 1000,
+            }).on('dataChanged', newData => {
+                // In this call-back, we also store the data into our selection
+                // before update the map with that contents.
+                selection.data = newData.categories.map(d => [d.name, d.value]);
+                servedByCt = getCategories(newData)
+                updateMap(selection);
+            });
+
+            const totalByCtView = new carto.dataview.Category(
+                sqlSource,  'ct2010', {
+                operation: carto.operation.COUNT,
+                limit: 1000,
+            }).on('dataChanged', newData => {
+                // In this call-back, we also store the data into our selection
+                // before update the map with that contents.
+                // selection.data = newData.categories.map(d => [d.name, d.value]);
+                // updateMap(gMap, selection);
+                totalByCt = getCategories(newData)
+                setTimeout(maybeInitScatter('scatter', "Total requests vs serve rate per census tract"), 1000)
+            });
+            
+            // After we create the views, we tell Carto's client to keep track
+            // of them (in order for them to reflect the data dynamically).
+            client.addDataview(servedByCtView);
+            client.addDataview(servedByHourView);
+            client.addDataview(totalByHourView);
+            client.addDataview(totalByCtView);
+            
+        }
+
+        // =====================================================================
+        // This is the same createChart() function as we have seen in previous
+        // labs. We create the chart inside the input group 'g', keeping track of
+        // the mapping group 'gMap', and use the data stored in 'byCuisine'.
+        //
+        // The only major change is in the update. Since we're connecting to a
+        // a database back-end, we only update the maps when the user clicks.
+        // Otherwise, it would be a strain on our data back-end.
+        // =====================================================================
+        function getKey(d) { return d[0] !== undefined ? d[0] : d }
+
+        function resetFilters(source) {
+            source.getFilters().forEach(d => d.resetFilters())
+        }
+
+        function createChart(id, data, sqlSource, selection, title) {
+            let margin = {left: 40, right:20, top: 40, bottom:40},
+                height = 200,
+                width = 550,
+                innerHeight = height - margin.top - margin.bottom,
+                innerWidth = width - margin.left - margin.right;
+                maxValue = d3.max(data, d => d[1]),
+                xScale   = d3.scaleBand()
+                            .domain(data.map(d => d[0]))
+                            .rangeRound([0, innerWidth]),
+                yScale   = d3.scaleLinear()
+                            .domain([0, Math.max(1, maxValue)])
+                            .rangeRound([innerHeight, 0])
+                svg      = d3.select(`#${id}`),
+                g        = svg.append("g")
+                                .attr("transform", `translate(${margin.left},${margin.top})`),
+                formatNumber = maxValue > 1 ? d3.format(".2s") : d3.format(".0%"),
+                selected = [],
+                filterRange = new carto.filter.Range('request_hour');
+
+            sqlSource.addFilter(filterRange)
+                
+            svg.attr("height", height)
+                .attr("width", width);
+
+            svg.append("text")
+                .attr("x", width/2)             
+                .attr("y", 10)
+                .attr("class", "title")
+                .attr("alignment-baseline","hanging")
+                .text(title);
+
+            g.append("g")
+                .attr("class", "axis axis--y")
+                .call(d3.axisLeft(yScale).ticks(6).tickFormat(formatNumber));  
+            
+            g.append("g")
+                .attr("class", "grid axis--y")
+                .attr("transform", `translate(${innerWidth},0)`)   
+                .call(d3.axisRight(yScale).ticks(6).tickSize(-(innerWidth)).tickFormat(""));
+
+            g.append("g")
+                .attr("class", "axis axis--x")
+                .attr("transform", `translate(0,${innerHeight})`)
+                .call(d3.axisBottom(xScale))
+                .append("text")
+                    .attr("class", "label")
+                    .attr("x", innerWidth/2)
+                    .attr("y", 30)
+                    .text("Hour");
+
+            g.selectAll(".bar")
+                .data(data, getKey)
+                .enter().append("rect")
+                .attr("class", "bar")
+                .attr('fill', 'lightGray')
+                .attr('stroke', 'black')
+                .attr("x", d => xScale(d[0]))
+                .attr("y", d => yScale(d[1]))
+                .attr("width", xScale.bandwidth()-2)
+                .attr("height", d => innerHeight - yScale(d[1]))
+
+            var average = d3.mean(data, d => d[1]); 
+
+            var line = d3.line()
+                .x((d,i) => xScale(d[0]) + i)
+                .y(d => yScale(average)); 
+
+            g.append("path")
+                .datum(data)
+                .attr("class", "mean")
+                .attr("d", line);
+
+            var brush = d3.brushX()
+                        .extent([[0, 0], [innerWidth, innerHeight]])
+                        .on("end", b => {
+                            if (!d3.event.sourceEvent) return;
+
+                            if (
+                                d3.event.sourceEvent &&
+                                d3.event.sourceEvent.type === "zoom"
+                            )
+                                return;
+                            if (d3.event.selection) {
+
+                                if (xScale.invert === undefined) {
+                                    var s = d3.event.selection;
+                                    s = data.filter(function(d) { return s[0] <= (d = xScale(d[0]) + xScale.bandwidth()/2) && d <= s[1]; }).map(d => d[0])
+                                    s = s.length ? s : null
+                                }
+                                else
+                                    var s = d3.event.selection.map(xScale.invert, xScale);
+                                    
+                                if (s && (selected.length == 0 || (selected[0] != s[0] || selected[1] != s[1]))) {
+                                    
+                                    resetFilters(sqlSource)
+                                    filterRange.set('between', {'min':s[0], 'max':s[s.length-1]})
+                                    
+                                    selected = s
+                                    // highlightCircles(selected)
+                                    updateBars(selected)
+                                }
+                            }
+                            else {
+                                selected = []
+                                resetFilters(sqlSource)
+                                // highlightCircles(selected)
+                                d3.select('.brush.active').dispatch("hide")
+                                updateBars(selected)
+                            } 
+                        })
+                        .on("start", b => { d3.select('.brush.active').dispatch("hide") });
+            var brushG = g.append("g")
+                        .attr("class", "brush")
+                        .call(brush)
+                        .on("reset", () => { brush.move(brushG, null) });
+        }
+
+        function updateBars(data) {
+
+            bars = d3.selectAll('.bar')
+                .data(data, getKey)
+                
+            bars.transition()
+                .attr('fill', 'steelBlue')
+            
+            bars.exit()
+                .transition()
+                .attr('fill', 'lightGray')
+        }
+
+        function createScatter(id, data, sqlSource, selection, title) {
+            let margin = {left: 100, right:20, top: 40, bottom:40},
+                height = 400,
+                width = 460,
+                innerHeight = height - margin.top - margin.bottom,
+                innerWidth = width - margin.left - margin.right;
+                xMax = d3.max(data, d => d[1]),
+                yMax = d3.max(data, d => d[2]),
+                x        = d3.scaleLinear()
+                            .domain([0, Math.max(1, xMax)])
+                            .rangeRound([0, innerWidth]),
+                y        = d3.scaleLinear()
+                            .domain([0, Math.max(1, Math.floor(yMax))])
+                            .rangeRound([innerHeight, 0])
+                svg      = d3.select(`#${id}`),
+                g        = svg.append("g")
+                                .attr("transform", `translate(${margin.left},${margin.top})`),
+                formatNumber = d3.format(".0%"),
+                selected = [],
+                filterCategory = new carto.filter.Category('request_hour'),
+                the_data = data;
+
+            sqlSource.addFilter(filterCategory)
+
+            svg.attr("height", height)
+                .attr("width", width);
+
+            svg.append("text")
+                .attr("x", margin.left + innerWidth/2)             
+                .attr("y", 10)
+                .attr("class", "title")
+                .attr("alignment-baseline","hanging")
+                .text(title);
+
+            yAxis = d3.axisLeft(y).ticks(5)
+
+            yAxisView = g.append('g')
+                .attr('class', 'axis axis-y')
+                .call(yAxis)
+            
+            yAxisView.append("text")
+                .attr("class", "label")
+                .attr("transform", "rotate(-90)") 
+                .attr("x", -innerHeight/2)
+                .attr("y", -50)
+                .text("Total requests");
+
+            g.append('g')
+                .attr('class', 'axis axis-x')
+                .attr('transform', `translate(0, ${innerHeight})`)
+                .call(d3.axisBottom(x).ticks(5).tickFormat(formatNumber))
+                .append("text")
+                    .attr("class", "label")
+                    .attr("x", innerWidth/2)
+                    .attr("y", 30)
+                    .text("Serve rate");
+
+            //Draw points
+            g.selectAll('.point')
+                .data(data, getKey).enter()
+                .append('circle')
+                .attr('class', 'point')
+                .attr('fill', 'lightGray')
+                .attr('stroke', 'black')
+                .attr("cx", d => x(d[1]))
+                .attr("cy", d => y(d[2]))
+                .transition()
+                .attr("r", 5)
+
+            //Average lines
+            var averageX = d3.mean(data, d => d[1]);
+            var averageY = d3.mean(data, d => d[2]);
+
+            var lineX = d3.line()
+                .x(d => x(averageX))
+                .y(d => y(d)); 
+            var lineY = d3.line()
+                .x(d => x(d))
+                .y(d => y(averageY)); 
+
+            lineXG = g.append("path")
+                .datum(y.domain())
+                .attr("class", "mean")
+                .attr("d", lineX);
+            
+            lineYG = g.append("path")
+                .datum(x.domain())
+                .attr("class", "mean")
+                .attr("d", lineY);
+
+            var brush = d3.brush()
+                        .extent([[-1, -1], [innerWidth+1, innerHeight+1]])
+                        .on("end", b => {
+                            if (!d3.event.sourceEvent) return;
+
+                            if (
+                                d3.event.sourceEvent &&
+                                d3.event.sourceEvent.type === "zoom"
+                            )
+                                return;
+                            if (d3.event.selection) {
+
+                                const [[x0, y0], [x1, y1]] = d3.event.selection;
+                                s = the_data.filter(d => x0 <= x(d[1]) && x(d[1]) < x1 && y0 <= y(d[2]) && y(d[2]) < y1);
+
+                                selected = s
+
+                                // resetFilters(sqlSource)
+                                // filterCategory.set('in', selected)
+
+                                highlightCircles(selected)
+                                // updateBars(selected)
+                                highlightMap(selected)
+                                brushG.classed('active', true)
+                            }
+                            else {
+                                selected = []
+                                // resetFilters(sqlSource)
+                                highlightCircles(selected)
+                                // updateBars(selected)
+                                highlightMap(selected)
+                                brushG.classed('active', false)
+                            } 
+                        })
+                        // .on("start", b => { d3.select('.brush.active').dispatch("reset") });
+            var brushG = g.append("g")
+                        .attr("class", "brush")
+                        .call(brush)
+                        .on("reset", () => { brush.move(brushG, null) })
+                        .on("hide", () => { brushG.select('.selection').style('display', 'none') });
+
+                        
+            function updateCircles(data) {
+
+                the_data = data
+
+                yMax = d3.max(data, d => d[2]),
+                y.domain([0, Math.max(1, Math.floor(yMax*1.1))])
+
+                yAxisView.call(yAxis)
+
+
+                averageX = d3.mean(data, d => d[1]);
+                averageY = d3.mean(data, d => d[2]);
+                
+                lineXG.datum(y.domain())
+                    .transition()
+                    .attr("d", lineX);
+                
+                lineYG.datum(x.domain())
+                    .transition()
+                    .attr("d", lineY);
+
+                circles = g.selectAll('.point')
+                    .data(data, getKey)
+
+                circles.enter()
+                    .append('circle')
+                    .attr('class', 'point')
+                    .attr('fill', 'lightGray')
+                    .attr('stroke', 'black')
+                    .attr("cx", d => x(d[1]))
+                    .attr("cy", d => y(d[2]))
+                    .transition()
+                    .attr("r", 5)
+
+                circles.transition()
+                    .attr("cx", d => x(d[1]))
+                    .attr("cy", d => y(d[2]))
+                    .attr('fill-opacity', 1)
+                    .attr('stroke-opacity', 1)
+                
+                circles.exit()
+                    .transition()
+                    .attr('fill-opacity', 0)
+                    .attr('stroke-opacity', 0)
+            }
+
+            return updateCircles;
+        }
+
+        function highlightCircles(data){
+
+            circles = d3.selectAll('.point')
+                .data(data, getKey)
+                
+            circles.transition()
+                .attr('fill', 'steelBlue')
+            
+            circles.exit()
+                .transition()
+                .attr('fill', 'lightGray')
+        }
+
+    </script>
+  </body>
+</html>
